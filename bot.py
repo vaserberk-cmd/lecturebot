@@ -2,10 +2,18 @@ import os
 import asyncio
 import tempfile
 import subprocess
+import shutil
 from pathlib import Path
 from groq import Groq
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Устанавливаем ffmpeg если не найден
+if not shutil.which("ffmpeg"):
+    print("ffmpeg не найден, устанавливаю...")
+    subprocess.run(["apt-get", "update", "-y"], check=False)
+    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=False)
+    print("ffmpeg установлен!")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
