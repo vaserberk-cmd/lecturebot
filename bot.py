@@ -23,7 +23,6 @@ client = Groq(api_key=GROQ_API_KEY)
 TEMP_DIR = Path("temp_audio")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Groq Whisper лимит — 25 МБ, ~15 минут MP3 128kbps
 MAX_SEGMENT_SEC = 800  # ~13 минут с запасом
 
 
@@ -37,7 +36,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_duration(path: str) -> float:
-    """Получает длительность аудио через ffprobe."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
@@ -47,7 +45,6 @@ def get_duration(path: str) -> float:
 
 
 def convert_to_mp3(input_path: str, output_path: str):
-    """Конвертирует любой аудиофайл в MP3 128kbps через ffmpeg."""
     subprocess.run(
         ["ffmpeg", "-y", "-i", input_path,
          "-ar", "16000", "-ac", "1", "-b:a", "128k", output_path],
@@ -55,8 +52,7 @@ def convert_to_mp3(input_path: str, output_path: str):
     )
 
 
-def split_audio(input_path: str, duration: float) -> list[str]:
-    """Разбивает MP3 на куски по MAX_SEGMENT_SEC секунд."""
+def split_audio(input_path: str, duration: float) -> list:
     chunks = []
     start = 0
     idx = 0
@@ -68,39 +64,65 @@ def split_audio(input_path: str, duration: float) -> list[str]:
              "-c", "copy", out_path],
             capture_output=True, check=True
         )
-        chunks.append(out_path)
+        chunks.append((out_path, start))  # путь + смещение времени
         start += MAX_SEGMENT_SEC
         idx += 1
     return chunks
 
 
-def transcribe_chunk(chunk_path: str, idx: int) -> str:
-    """Отправляет кусок аудио в Groq Whisper."""
+def seconds_to_timestamp(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def transcribe_chunk(chunk_path: str, idx: int, time_offset: float = 0.0) -> str:
+    """Отправляет кусок аудио в Groq Whisper с временными метками."""
     with open(chunk_path, "rb") as f:
         result = client.audio.transcriptions.create(
             file=(f"chunk_{idx}.mp3", f.read()),
             model="whisper-large-v3",
             language="ru",
-            response_format="text",
+            response_format="verbose_json",
         )
-    return result if isinstance(result, str) else result.text
+
+    lines = []
+    if hasattr(result, "segments") and result.segments:
+        for seg in result.segments:
+            start = seg.start + time_offset
+            text = seg.text.strip()
+            if text:
+                ts = seconds_to_timestamp(start)
+                text = text[0].upper() + text[1:]
+                lines.append(f"{ts} - {text}")
+    else:
+        # fallback если нет сегментов
+        text = result.text.strip() if hasattr(result, "text") else str(result)
+        if text:
+            ts = seconds_to_timestamp(time_offset)
+            lines.append(f"{ts} - {text}")
+
+    return "\n\n".join(lines)
 
 
 async def send_long_text(message, text: str):
-    """Отправляет длинный текст частями по 4000 символов."""
+    """Отправляет длинный текст частями, не разрывая блоки с метками."""
     MAX_LEN = 4000
+    blocks = text.split("\n\n")
     parts = []
     current = ""
-    for sentence in text.split(". "):
-        chunk = sentence + ". "
-        if len(current) + len(chunk) > MAX_LEN:
-            if current:
-                parts.append(current.strip())
-            current = chunk
+
+    for block in blocks:
+        if len(current) + len(block) + 2 > MAX_LEN and current:
+            parts.append(current.strip())
+            current = block + "\n\n"
         else:
-            current += chunk
+            current += block + "\n\n"
+
     if current.strip():
         parts.append(current.strip())
+
     if not parts:
         parts = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
 
@@ -115,7 +137,7 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     input_path = None
     mp3_path = None
-    chunks = []
+    chunk_paths = []
 
     try:
         if message.voice:
@@ -147,13 +169,14 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration = await loop.run_in_executor(None, get_duration, mp3_path)
         duration_min = duration / 60
 
-        # Разбиваем если длиннее одного сегмента
         if duration > MAX_SEGMENT_SEC:
             chunks = await loop.run_in_executor(None, split_audio, mp3_path, duration)
         else:
-            chunks = [mp3_path]
+            chunks = [(mp3_path, 0.0)]
 
+        chunk_paths = [c[0] for c in chunks if c[0] != mp3_path]
         total_chunks = len(chunks)
+
         await status_msg.edit_text(
             f"Длительность: {duration_min:.1f} мин\n"
             f"Частей: {total_chunks}\n"
@@ -161,16 +184,18 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         all_text = []
-        for i, chunk_path in enumerate(chunks, 1):
+        for i, (chunk_path, time_offset) in enumerate(chunks, 1):
             await status_msg.edit_text(
                 f"Распознаю часть {i}/{total_chunks}...\n"
                 f"{'█' * i}{'░' * (total_chunks - i)} {int(i/total_chunks*100)}%"
             )
-            text = await loop.run_in_executor(None, transcribe_chunk, chunk_path, i)
+            text = await loop.run_in_executor(
+                None, transcribe_chunk, chunk_path, i, time_offset
+            )
             if text:
                 all_text.append(text.strip())
 
-        full_text = " ".join(all_text).strip()
+        full_text = "\n\n".join(all_text).strip()
 
         if full_text:
             await status_msg.edit_text(f"Готово! Распознано {len(full_text)} символов.")
@@ -189,8 +214,8 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     finally:
-        for path in ([input_path, mp3_path] + chunks):
-            if path and os.path.exists(path) and path != mp3_path or (path == mp3_path and chunks != [mp3_path]):
+        for path in ([input_path] + chunk_paths):
+            if path and os.path.exists(path):
                 try:
                     os.unlink(path)
                 except Exception:
