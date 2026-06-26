@@ -88,17 +88,32 @@ def transcribe_chunk(chunk_path: str, idx: int, time_offset: float = 0.0) -> str
         )
 
     lines = []
-    if hasattr(result, "segments") and result.segments:
-        for seg in result.segments:
-            start = seg.start + time_offset
-            text = seg.text.strip()
+    # Groq возвращает сегменты как список словарей
+    segments = None
+    if isinstance(result, dict):
+        segments = result.get("segments")
+    elif hasattr(result, "segments"):
+        segments = result.segments
+
+    if segments:
+        for seg in segments:
+            # сегмент может быть словарём или объектом
+            if isinstance(seg, dict):
+                start = seg.get("start", 0.0) + time_offset
+                text = seg.get("text", "").strip()
+            else:
+                start = seg.start + time_offset
+                text = seg.text.strip()
             if text:
                 ts = seconds_to_timestamp(start)
                 text = text[0].upper() + text[1:]
                 lines.append(f"{ts} - {text}")
     else:
         # fallback если нет сегментов
-        text = result.text.strip() if hasattr(result, "text") else str(result)
+        if isinstance(result, dict):
+            text = result.get("text", "").strip()
+        else:
+            text = result.text.strip() if hasattr(result, "text") else str(result)
         if text:
             ts = seconds_to_timestamp(time_offset)
             lines.append(f"{ts} - {text}")
